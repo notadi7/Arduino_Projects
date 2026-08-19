@@ -16,9 +16,8 @@ What's Included
 * Timer & Counter Programming
 * Interrupt Programming
 * Serial Communication (UART)
-* PWM Generation
 * Sensor Interfacing
-* Embedded C & Assembly Language Programs
+* Embedded C 
 * And Many More 8051-Based Projects
 
 Objective
