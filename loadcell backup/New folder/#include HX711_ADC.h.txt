@@ -1,0 +1,483 @@
+#include <HX711_ADC.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+
+// Keypad Setup - Using Digital Pins 22-29
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {22, 23, 24, 25}; // Rows
+byte colPins[COLS] = {26, 27, 28, 29}; // Columns
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Pins
+#define LOADCELL_DOUT_PIN 3
+#define LOADCELL_SCK_PIN 2
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+#define IR_SENSOR_GATE1 6  // Active LOW (0 = car detected)
+#define IR_SENSOR_GATE2 7  // Active LOW (0 = car detected)
+#define GATE1_IN1 8
+#define GATE1_IN2 9
+#define GATE2_IN1 10
+#define GATE2_IN2 11
+
+// Constants
+const unsigned long GATE_OPEN_TIME = 3000; // 3 seconds operation
+const float WEIGHT_MIN = 1.0;
+const float WEIGHT_MAX = 50.0;
+const float HEIGHT_MIN = 5.0;
+const float HEIGHT_MAX = 11.0;
+const unsigned long STABILIZATION_TIME = 1000; // 1s stabilization
+const float WEIGHT_THRESHOLD = 0.5; // 0.5g change = stable
+const float HEIGHT_THRESHOLD = 0.3; // 0.3cm change = stable
+
+// Objects
+HX711_ADC scale(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+LiquidCrystal_I2C lcd(0x27, 20, 4); // I2C address 0x27, 20x4 display
+
+// System State (Modified enum names to avoid conflict)
+enum GateState { GATE_CLOSED, GATE_OPENING, GATE_OPEN, GATE_CLOSING };
+GateState gate1State = GATE_CLOSED;
+GateState gate2State = GATE_CLOSED;
+unsigned long gateActionStartTime = 0;
+
+// Manual Mode Variables
+bool manualMode = false;
+String inputPassword = "";
+const String GATE1_PASSWORD = "2580"; // 2nd column keys
+const String GATE2_PASSWORD = "369#"; // 3rd column keys
+
+// Measurement Stability
+bool weightStable = false;
+bool heightStable = false;
+unsigned long weightStableTime = 0;
+unsigned long heightStableTime = 0;
+float previousWeight = 0;
+float previousHeight = 0;
+
+// Current Measurements
+float currentWeight = 0;
+float currentHeight = 0;
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" Real Time Vehicle ");
+  lcd.setCursor(0, 1);
+  lcd.print("Saftey & Regulation");
+  lcd.setCursor(0, 2);
+  lcd.print(" Monitoring System");
+  lcd.setCursor(0, 3);
+  lcd.print("    Loading....      ");
+  delay(5000); // show intro for 5 seconds
+
+  // Initialize Load Cell
+  scale.begin();
+  scale.start(2000);
+  scale.setCalFactor(696.0); // Calibrate this!
+  
+  // Initialize Sensors
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_SENSOR_GATE1, INPUT_PULLUP);
+  pinMode(IR_SENSOR_GATE2, INPUT_PULLUP);
+  
+  // Initialize Motors
+  pinMode(GATE1_IN1, OUTPUT);
+  pinMode(GATE1_IN2, OUTPUT);
+  pinMode(GATE2_IN1, OUTPUT);
+  pinMode(GATE2_IN2, OUTPUT);
+  
+  // Close all gates
+  stopGate1();
+  stopGate2();
+  
+  delay(1000);
+  lcd.clear();
+}
+
+void loop() {
+  char key = keypad.getKey();
+  
+  // Toggle manual mode with '1' key
+  if (key == '1') {
+    manualMode = !manualMode;
+    if (manualMode) {
+      enterManualMode();
+    } else {
+      exitManualMode();
+    }
+    delay(200); // Debounce
+  }
+
+  if (manualMode) {
+    handleManualMode(key);
+    updateManualModeGateStatus(); // Only update gate status in manual mode
+  } else {
+    // Original automatic mode code remains completely unchanged
+    takeMeasurements();
+    checkWeightStability();
+    checkHeightStability();
+    updateDisplay();
+    
+    if (weightStable && heightStable) {
+      controlGates();
+    }
+  }
+  
+  // Handle gate timing in both modes
+  handleGateTiming();
+  
+  delay(50);
+}
+
+// Manual Mode Functions (New Implementation)
+void enterManualMode() {
+  lcd.clear();
+  lcd.setCursor(0, 1);
+  lcd.print(" ENTER MANUAL MODE");
+  lcd.setCursor(0, 2);
+  lcd.print("    LOADING...");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("MANUAL MODE");
+  lcd.setCursor(0, 1);
+  lcd.print("ENTER 4D COMMAND:");
+  inputPassword = "";
+}
+
+void exitManualMode() {
+  lcd.clear();
+  lcd.setCursor(0, 1);
+  lcd.print(" EXIT MANUAL MODE");
+  lcd.setCursor(0, 2);
+  lcd.print("    LOADING...");
+  delay(2000);
+  
+  inputPassword = "";
+  lcd.clear();
+}
+
+void handleManualMode(char key) {
+  if (!key || key == '1') return; // Skip if no key or mode toggle key
+  
+  inputPassword += key;
+  
+  // Display stars on 3rd row
+  lcd.setCursor(0, 2);
+  lcd.print("                ");
+  lcd.setCursor(0, 2);
+  for (int i = 0; i < inputPassword.length(); i++) {
+    lcd.print('*');
+  }
+  
+  if (inputPassword.length() == 4) {
+    processManualCommand();
+    // Reset for new command
+    inputPassword = "";
+    lcd.setCursor(0, 1);
+    lcd.print("ENTER 4D COMMAND:");
+    lcd.setCursor(0, 2);
+    lcd.print("                ");
+  }
+}
+
+void processManualCommand() {
+  lcd.setCursor(0, 2);
+  lcd.print(" ");
+  
+  if (inputPassword == GATE1_PASSWORD) {
+    operateGate(1);
+    lcd.print("VALID COMMAND G1");
+  } 
+  else if (inputPassword == GATE2_PASSWORD) {
+    operateGate(2);
+    lcd.print("VALID COMMAND G2");
+  } 
+  else {
+    lcd.print("INVALID COMMAND");
+  }
+  delay(1000);
+  lcd.setCursor(0, 2);
+  lcd.print("                  ");
+}
+
+void operateGate(int gateNum) {
+  if (gateNum == 1) {
+    if (gate1State == GATE_CLOSED || gate1State == GATE_CLOSING) {
+      startOpeningGate1();
+    } else {
+      startClosingGate1();
+    }
+  } else {
+    if (gate2State == GATE_CLOSED || gate2State == GATE_CLOSING) {
+      startOpeningGate2();
+    } else {
+      startClosingGate2();
+    }
+  }
+}
+
+void updateManualModeGateStatus() {
+  lcd.setCursor(0, 3);
+  lcd.print("G1:");
+  switch(gate1State) {
+    case GATE_CLOSED: lcd.print("CLOSED "); break;
+    case GATE_OPENING: lcd.print("OPENING"); break;
+    case GATE_OPEN: lcd.print("OPEN   "); break;
+    case GATE_CLOSING: lcd.print("CLOSING"); break;
+  }
+  
+  lcd.setCursor(10, 3);
+  lcd.print("G2:");
+  switch(gate2State) {
+    case GATE_CLOSED: lcd.print("CLOSED "); break;
+    case GATE_OPENING: lcd.print("OPENING"); break;
+    case GATE_OPEN: lcd.print("OPEN   "); break;
+    case GATE_CLOSING: lcd.print("CLOSING"); break;
+  }
+}
+
+void handleGateTiming() {
+  unsigned long currentTime = millis();
+  
+  // Gate 1 timing
+  if ((gate1State == GATE_OPENING || gate1State == GATE_CLOSING) && 
+      (currentTime - gateActionStartTime >= GATE_OPEN_TIME)) {
+    if (gate1State == GATE_OPENING) {
+      stopGate1();
+      gate1State = GATE_OPEN;
+    } else {
+      stopGate1();
+      gate1State = GATE_CLOSED;
+    }
+  }
+  
+  // Gate 2 timing
+  if ((gate2State == GATE_OPENING || gate2State == GATE_CLOSING) && 
+      (currentTime - gateActionStartTime >= GATE_OPEN_TIME)) {
+    if (gate2State == GATE_OPENING) {
+      stopGate2();
+      gate2State = GATE_OPEN;
+    } else {
+      stopGate2();
+      gate2State = GATE_CLOSED;
+    }
+  }
+}
+
+// ALL ORIGINAL AUTOMATIC SYSTEM FUNCTIONS REMAIN EXACTLY THE SAME
+void takeMeasurements() {
+  if (scale.update()) {
+    currentWeight = abs(scale.getData());
+  }
+  
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  currentHeight = pulseIn(ECHO_PIN, HIGH) * 0.034 / 2;
+}
+
+void checkWeightStability() {
+  if (abs(currentWeight - previousWeight) > WEIGHT_THRESHOLD) {
+    weightStable = false;
+    weightStableTime = millis();
+  } else if (millis() - weightStableTime > STABILIZATION_TIME) {
+    weightStable = true;
+  }
+  previousWeight = currentWeight;
+}
+
+void checkHeightStability() {
+  if (abs(currentHeight - previousHeight) > HEIGHT_THRESHOLD) {
+    heightStable = false;
+    heightStableTime = millis();
+  } else if (millis() - heightStableTime > STABILIZATION_TIME) {
+    heightStable = true;
+  }
+  previousHeight = currentHeight;
+}
+
+void updateDisplay() {
+  lcd.setCursor(0, 0);
+  lcd.print("W:");
+  lcd.print(currentWeight, 1);
+  lcd.print("g    H:");
+  lcd.print(currentHeight, 1);
+  lcd.print("cm");
+  
+  lcd.setCursor(0, 1);
+  lcd.print("W:");
+  lcd.print(weightStable ? "STABLE  " : "SETTLING");
+  
+  lcd.setCursor(10, 1);
+  lcd.print("H:");
+  lcd.print(heightStable ? "STABLE  " : "SETTLING");
+  
+  lcd.setCursor(0, 2);
+  lcd.print("G1:");
+  switch(gate1State) {
+    case GATE_CLOSED: lcd.print("CLOSED "); break;
+    case GATE_OPENING: lcd.print("OPENING"); break;
+    case GATE_OPEN: lcd.print("OPEN   "); break;
+    case GATE_CLOSING: lcd.print("CLOSING"); break;
+  }
+  
+  lcd.setCursor(10, 2);
+  lcd.print("G2:");
+  switch(gate2State) {
+    case GATE_CLOSED: lcd.print("CLOSED "); break;
+    case GATE_OPENING: lcd.print("OPENING"); break;
+    case GATE_OPEN: lcd.print("OPEN   "); break;
+    case GATE_CLOSING: lcd.print("CLOSING"); break;
+  }
+  
+  lcd.setCursor(0, 3);
+  lcd.print("IR1:");
+  lcd.print(digitalRead(IR_SENSOR_GATE1) == LOW ? "P " : "NP");
+  
+  lcd.setCursor(10, 3);
+  lcd.print("IR2:");
+  lcd.print(digitalRead(IR_SENSOR_GATE2) == LOW ? "P " : "NP");
+}
+
+void controlGates() {
+  controlGate1();
+  controlGate2();
+}
+
+void controlGate1() {
+  bool irDetected = (digitalRead(IR_SENSOR_GATE1) == LOW);
+  
+  switch(gate1State) {
+    case GATE_CLOSED:
+      if (currentWeight > WEIGHT_MIN && currentWeight < WEIGHT_MAX &&
+          currentHeight > HEIGHT_MIN && currentHeight < HEIGHT_MAX) {
+        startOpeningGate1();
+      }
+      break;
+      
+    case GATE_OPENING:
+      if (millis() - gateActionStartTime >= GATE_OPEN_TIME) {
+        finishOpeningGate1();
+      }
+      break;
+      
+    case GATE_OPEN:
+      if (irDetected) {
+        startClosingGate1();
+      }
+      break;
+      
+    case GATE_CLOSING:
+      if (millis() - gateActionStartTime >= GATE_OPEN_TIME) {
+        finishClosingGate1();
+      }
+      break;
+  }
+}
+
+void controlGate2() {
+  bool irDetected = (digitalRead(IR_SENSOR_GATE2) == LOW);
+  
+  switch(gate2State) {
+    case GATE_CLOSED:
+      if (currentWeight > WEIGHT_MIN && 
+          (currentWeight >= WEIGHT_MAX || currentHeight <= HEIGHT_MIN || currentHeight >= HEIGHT_MAX)) {
+        startOpeningGate2();
+      }
+      break;
+      
+    case GATE_OPENING:
+      if (millis() - gateActionStartTime >= GATE_OPEN_TIME) {
+        finishOpeningGate2();
+      }
+      break;
+      
+    case GATE_OPEN:
+      if (irDetected) {
+        startClosingGate2();
+      }
+      break;
+      
+    case GATE_CLOSING:
+      if (millis() - gateActionStartTime >= GATE_OPEN_TIME) {
+        finishClosingGate2();
+      }
+      break;
+  }
+}
+
+void startOpeningGate1() {
+  digitalWrite(GATE1_IN1, HIGH);
+  digitalWrite(GATE1_IN2, LOW);
+  gate1State = GATE_OPENING;
+  gateActionStartTime = millis();
+}
+
+void finishOpeningGate1() {
+  stopGate1();
+  gate1State = GATE_OPEN;
+}
+
+void startClosingGate1() {
+  digitalWrite(GATE1_IN1, LOW);
+  digitalWrite(GATE1_IN2, HIGH);
+  gate1State = GATE_CLOSING;
+  gateActionStartTime = millis();
+}
+
+void finishClosingGate1() {
+  stopGate1();
+  gate1State = GATE_CLOSED;
+}
+
+void startOpeningGate2() {
+  digitalWrite(GATE2_IN1, HIGH);
+  digitalWrite(GATE2_IN2, LOW);
+  gate2State = GATE_OPENING;
+  gateActionStartTime = millis();
+}
+
+void finishOpeningGate2() {
+  stopGate2();
+  gate2State = GATE_OPEN;
+}
+
+void startClosingGate2() {
+  digitalWrite(GATE2_IN1, LOW);
+  digitalWrite(GATE2_IN2, HIGH);
+  gate2State = GATE_CLOSING;
+  gateActionStartTime = millis();
+}
+
+void finishClosingGate2() {
+  stopGate2();
+  gate2State = GATE_CLOSED;
+}
+
+void stopGate1() {
+  digitalWrite(GATE1_IN1, LOW);
+  digitalWrite(GATE1_IN2, LOW);
+}
+
+void stopGate2() {
+  digitalWrite(GATE2_IN1, LOW);
+  digitalWrite(GATE2_IN2, LOW);
+}
